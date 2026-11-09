@@ -69,6 +69,25 @@ pub fn go_home() {
     (super::port().go_home)()
 }
 
+#[cfg(any(test, feature = "test-support"))]
+static RETURN_REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The app ids [`return_to`] has been asked for, this process, oldest first. **Test-only**, like
+/// [`home_requests`]: the call's whole effect is on a television.
+#[cfg(any(test, feature = "test-support"))]
+pub fn return_requests() -> Vec<String> {
+    RETURN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// **Hand the screen to the app a launch link named**, once the playback it asked for has ended
+/// (`docs/launch-links.md`, `returnTo`). Like [`go_home`] the process keeps running; unlike it there
+/// is no press to claim, since the request comes from the link once, not from a key.
+pub fn return_to(app_id: &str) {
+    #[cfg(any(test, feature = "test-support"))]
+    RETURN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).push(app_id.to_owned());
+    (super::port().return_to)(app_id)
+}
+
 /// The frame thread's half of a root press: the platform's fallback leg, when its off-thread leg
 /// asked for one.
 pub fn poll() {

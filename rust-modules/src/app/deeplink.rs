@@ -11,6 +11,10 @@
 //! - `server` (optional): the server's `machineIdentifier`. Without it, the signed-in current server.
 //! - `action` (optional): `open` (the default) lands on the item's detail page; `play` starts it
 //!   where Resume would. Anything else is `open`.
+//! - `returnTo` (optional, with `play`): the app id to hand the screen to once the playback the link
+//!   started has ended (BACK or STOP in the player, or the end of the last item). A launcher's own id,
+//!   so a viewer who picked a title there lands back there rather than on this app's Home. See
+//!   "Returning" below. Ignored with `open`; an id that is not a plain app id makes the link `Bad`.
 //! - Unknown keys are ignored. No `plex` object at all is an ordinary launch.
 //! - A launch while the app runs carries the link too, where LG's SDL lets the app read relaunch
 //!   payloads (`app::boot::tap_relaunch_payloads`, webOS 7.4 on); the page then replaces wherever
@@ -48,6 +52,17 @@
 //! session is gone and the stack has settled, and gives up after `LEAVE_WAIT_MS` (the engine that
 //! never dies). A newer link replaces the one on its way out without a second Exit.
 //!
+//! **Returning.** A `play` link with a `returnTo` does not go idle once it has armed the landing: it
+//! moves to `Returning` and watches the same `session_stands` fact. It waits for playback to start
+//! (bounded by `RETURN_START_WAIT_MS`, so a key the server does not know, or a play the engine
+//! refused, ends it quietly), then for that session to be gone and the stack to settle, and then
+//! asks [`perform`] to hand the screen over (`LinkOut::return_to`, performed by
+//! `plx_platform::tv::home::return_to`). A parked session still stands, so pressing the TV's own
+//! Home mid-film and coming back is not an ending; Up Next's advance keeps the player up, so a
+//! run of episodes returns once, after the last. If the window is not foregrounded when the
+//! session ends, someone else has the screen, so nothing is handed over. A newer link replaces a
+//! return that is still watching.
+//!
 //! **How the DID composes it.** The warm launch's DID foreground (`run.rs`,
 //! `did_foreground_with_link`) steps the link first with the same inputs and lets its output pick
 //! the lifecycle's input: `leaves_playback` makes it `DidForegroundSuperseded` (claims nothing,
@@ -69,14 +84,16 @@ pub(crate) struct Link {
     pub(crate) server: Option<String>,
     pub(crate) rk: String,
     pub(crate) action: Action,
+    /// `returnTo`: the app to hand the screen to when a `play` link's playback ends.
+    pub(crate) return_to: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Parsed {
     /// No `plex` object: an ordinary launch.
     None,
-    /// A `plex` object that names nothing openable.
-    Bad,
+    /// A `plex` object that cannot be acted on, and why (for the event log).
+    Bad(&'static str),
     Link(Link),
 }
 
@@ -89,10 +106,10 @@ pub(crate) fn parse(raw: &str) -> Parsed {
     let rk = match plex.get("ratingKey") {
         Some(serde_json::Value::String(s)) => s.trim().to_owned(),
         Some(serde_json::Value::Number(n)) if n.is_u64() => n.to_string(),
-        _ => return Parsed::Bad,
+        _ => return Parsed::Bad("bad ratingKey"),
     };
     if rk.is_empty() || rk.len() > 20 || !rk.bytes().all(|b| b.is_ascii_digit()) {
-        return Parsed::Bad;
+        return Parsed::Bad("bad ratingKey");
     }
     let server = plex.get("server").and_then(|s| s.as_str()).map(str::trim)
         .filter(|s| !s.is_empty()).map(str::to_owned);
@@ -100,7 +117,24 @@ pub(crate) fn parse(raw: &str) -> Parsed {
         Some("play") => Action::Play,
         _ => Action::Open,
     };
-    Parsed::Link(Link { server, rk, action })
+    let return_to = match plex.get("returnTo") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
+        Some(serde_json::Value::String(s)) if is_app_id(s.trim()) => Some(s.trim().to_owned()),
+        // Named but unusable: refusing the whole link says so, where ignoring it would leave a
+        // caller wondering why its viewers never come back.
+        Some(_) => return Parsed::Bad("bad returnTo"),
+    };
+    Parsed::Link(Link { server, rk, action, return_to })
+}
+
+/// A webOS app id as SAM takes one: letters, digits, `.`, `-` and `_`, starting with a letter or a
+/// digit, at most 128 bytes. It goes into a bus payload by [`plx_platform::tv::home::return_to`],
+/// so nothing that could close or extend the JSON gets past this.
+fn is_app_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128
+        && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 /// How long a link waits for its server to appear in the roster once Home is up: shared servers
@@ -111,6 +145,11 @@ const SERVER_WAIT_MS: u32 = 15_000;
 /// player page popped) before it gives up. The ritual finishes within a few frames and the return
 /// hold is `CW_RETURN_HOLD_MS` (300 ms); this bounds an engine that never dies.
 const LEAVE_WAIT_MS: u32 = 5_000;
+
+/// How long a returning link waits for the playback it armed to start. The landing's own waits are
+/// `MenuPlayAwait`'s 12 s ceiling for the metadata and the play door's 12 s for an engine a preview
+/// is still letting go of; past both, the play is not coming.
+const RETURN_START_WAIT_MS: u32 = 30_000;
 
 /// What one frame brings the link: a payload that arrived (already read by pure [`parse`]), or
 /// nothing new.
@@ -164,6 +203,9 @@ pub(crate) struct LinkOut {
     /// This step emitted `PlayerReq::Exit`: the link is ending playback, so a DID foreground that
     /// is being composed with it must not restore the film (`ForegroundInput::DidForegroundSuperseded`).
     pub(crate) leaves_playback: bool,
+    /// The linked playback has ended: hand the screen to this app (`returnTo`). A platform call with
+    /// no effect value, so, like `arm`, it is the runner's to perform.
+    pub(crate) return_to: Option<String>,
 }
 
 /// The link not yet handed to the menu-play wait. Owned by `App`; the state is private, so only
@@ -182,6 +224,9 @@ enum LinkState {
     /// The link asked playback to end (one `Exit`, emitted on entering this state) and waits for
     /// the session to be gone. `leave_deadline` bounds an engine that never dies.
     Leaving { link: Link, crossed_sign_in: bool, leave_deadline: u32 },
+    /// A `play` link with a `returnTo` has armed its landing and watches for its playback to end.
+    /// `started` is set the first frame a session stands; until then `start_deadline` bounds the wait.
+    Returning { app: String, started: bool, start_deadline: u32 },
 }
 
 fn expired(now: u32, deadline: u32) -> bool { now.wrapping_sub(deadline) < u32::MAX / 2 }
@@ -196,7 +241,7 @@ impl DeepLink {
             match parsed {
                 // A launch without a link (the launcher's own icon) leaves one still waiting alone.
                 Parsed::None => {}
-                Parsed::Bad => out.fx.push(log_line("deeplink: not opened (bad ratingKey)")),
+                Parsed::Bad(why) => out.fx.push(log_line(format!("deeplink: not opened ({why})"))),
                 Parsed::Link(link) => {
                     out.fx.push(log_line(format!(
                         "deeplink: {:?} rk={} server={}", link.action, link.rk,
@@ -212,6 +257,9 @@ impl DeepLink {
         }
         if matches!(self.0, LinkState::Leaving { .. }) {
             return self.leaving(env, out);
+        }
+        if matches!(self.0, LinkState::Returning { .. }) {
+            return self.returning(env, out);
         }
         let LinkState::Waiting { link, server_deadline, crossed_sign_in } = &mut self.0 else { return out };
         match env.root {
@@ -278,7 +326,37 @@ impl DeepLink {
             plx_data::stores::StoreCmd::Metadata(plx_data::stores::metadata::MetadataCmd::RequestDetail {
                 sid, rk: link.rk.clone() }),
         )));
+        if let (Action::Play, Some(app)) = (link.action, link.return_to) {
+            out.fx.push(log_line(format!("deeplink: returns to {app} when the playback ends")));
+            self.0 = LinkState::Returning {
+                app, started: false, start_deadline: env.now.wrapping_add(RETURN_START_WAIT_MS) };
+        }
         out.arm = Some((sid, link.rk, link.action == Action::Open));
+        out
+    }
+
+    /// A frame in `Returning`: note the playback starting, then, once it has ended and the stack
+    /// has settled, ask for the screen to go back to the caller. Asks at most once.
+    fn returning(&mut self, env: &LinkEnv, mut out: LinkOut) -> LinkOut {
+        let LinkState::Returning { app, started, start_deadline } = std::mem::take(&mut self.0) else {
+            return out;
+        };
+        if env.session_stands {
+            self.0 = LinkState::Returning { app, started: true, start_deadline };
+        } else if !started {
+            if expired(env.now, start_deadline) {
+                out.fx.push(log_line("deeplink: no return (the playback never started)"));
+            } else {
+                self.0 = LinkState::Returning { app, started, start_deadline };
+            }
+        } else if env.nav_pending {
+            self.0 = LinkState::Returning { app, started, start_deadline };
+        } else if !env.foreground {
+            out.fx.push(log_line("deeplink: no return (another app has the screen)"));
+        } else {
+            out.fx.push(log_line(format!("deeplink: playback ended, returning to {app}")));
+            out.return_to = Some(app);
+        }
         out
     }
 
@@ -314,6 +392,9 @@ impl DeepLink {
 
     #[cfg(test)]
     pub(crate) fn is_leaving(&self) -> bool { matches!(self.0, LinkState::Leaving { .. }) }
+
+    #[cfg(test)]
+    pub(crate) fn is_returning(&self) -> bool { matches!(self.0, LinkState::Returning { .. }) }
 
     #[cfg(test)]
     fn leaving_rk(&self) -> Option<&str> {
@@ -391,8 +472,8 @@ pub(crate) fn link_inputs(
 }
 
 /// Hand a step's output to the executors that already exist. It makes no decisions: a structural
-/// op goes through `Dispatcher::request`, any other effect through `Dispatcher::emit`, and the
-/// wait is the one app-loop write.
+/// op goes through `Dispatcher::request`, any other effect through `Dispatcher::emit`, the wait is
+/// the one app-loop write, and a return is the platform's request.
 pub(crate) fn perform(
     out: LinkOut,
     pages: &mut plx_ui::dispatch::Dispatcher<AppHost>,
@@ -407,6 +488,9 @@ pub(crate) fn perform(
     }
     if let Some((sid, rk, open)) = out.arm {
         *menu_play_await = Some(super::input::MenuPlayAwait::for_link(sid, rk, open, now));
+    }
+    if let Some(app) = out.return_to {
+        plx_platform::tv::home::return_to(&app);
     }
 }
 
@@ -429,7 +513,7 @@ mod tests {
     use super::*;
 
     fn link(server: Option<&str>, rk: &str, action: Action) -> Parsed {
-        Parsed::Link(Link { server: server.map(str::to_owned), rk: rk.to_owned(), action })
+        Parsed::Link(Link { server: server.map(str::to_owned), rk: rk.to_owned(), action, return_to: None })
     }
 
     /// The cold-launch argument exactly as SAM wrote it on the television (webOS 9.2.2).
@@ -469,7 +553,7 @@ mod tests {
             r#"{"ratingKey":-3}"#,
             r#"{"ratingKey":1.5}"#,
         ] {
-            assert_eq!(parse(&format!(r#"{{"parameters":{{"plex":{bad}}}}}"#)), Parsed::Bad, "{bad}");
+            assert_eq!(parse(&format!(r#"{{"parameters":{{"plex":{bad}}}}}"#)), Parsed::Bad("bad ratingKey"), "{bad}");
         }
     }
 
@@ -524,7 +608,7 @@ mod tests {
 
     fn waiting(server: Option<&str>, crossed: bool) -> DeepLink {
         DeepLink::waiting_for_test(
-            Link { server: server.map(str::to_owned), rk: "7".into(), action: Action::Open }, None, crossed)
+            Link { server: server.map(str::to_owned), rk: "7".into(), action: Action::Open, return_to: None }, None, crossed)
     }
 
     #[test]
@@ -624,11 +708,11 @@ mod tests {
         let mut link = DeepLink::default();
         let mut e = env(&KNOWN);
         e.root = Root::Other;
-        let arrived = LinkEvent::Arrived(Parsed::Link(Link { server: None, rk: "9".into(), action: Action::Play }));
+        let arrived = LinkEvent::Arrived(Parsed::Link(Link { server: None, rk: "9".into(), action: Action::Play, return_to: None }));
         let out = link.step(arrived, &e);
         assert_eq!(fx_names(&out.fx), ["log:deeplink: Play rk=9 server=current"]);
         assert!(!link.is_idle());
-        let out = link.step(LinkEvent::Arrived(Parsed::Bad), &e);
+        let out = link.step(LinkEvent::Arrived(Parsed::Bad("bad ratingKey")), &e);
         assert_eq!(fx_names(&out.fx), ["log:deeplink: not opened (bad ratingKey)"]);
         let out = link.step(LinkEvent::Arrived(Parsed::None), &e);
         assert!(fx_names(&out.fx).is_empty() && !link.is_idle());
@@ -661,8 +745,8 @@ mod tests {
     #[test]
     fn link_step_an_arrival_while_leaving_replaces_the_link_without_a_second_exit() {
         let mut link = DeepLink::leaving_for_test(
-            Link { server: None, rk: "7".into(), action: Action::Open }, 1_000 + LEAVE_WAIT_MS);
-        let arrived = LinkEvent::Arrived(Parsed::Link(Link { server: None, rk: "9".into(), action: Action::Play }));
+            Link { server: None, rk: "7".into(), action: Action::Open, return_to: None }, 1_000 + LEAVE_WAIT_MS);
+        let arrived = LinkEvent::Arrived(Parsed::Link(Link { server: None, rk: "9".into(), action: Action::Play, return_to: None }));
         let out = link.step(arrived, &standing(&KNOWN));
         assert_eq!(fx_names(&out.fx), ["log:deeplink: Play rk=9 server=current"]);
         assert!(!out.leaves_playback && link.is_leaving() && link.leaving_rk() == Some("9"));
@@ -671,7 +755,7 @@ mod tests {
     #[test]
     fn link_step_leaving_waits_while_the_session_or_the_stack_moves() {
         let mut link = DeepLink::leaving_for_test(
-            Link { server: None, rk: "7".into(), action: Action::Open }, 1_000 + LEAVE_WAIT_MS);
+            Link { server: None, rk: "7".into(), action: Action::Open, return_to: None }, 1_000 + LEAVE_WAIT_MS);
         let mut e = env(&KNOWN);
         e.nav_pending = true;
         assert!(fx_names(&link.step(LinkEvent::Frame, &e).fx).is_empty() && link.is_leaving());
@@ -683,7 +767,7 @@ mod tests {
     #[test]
     fn link_step_leaving_returns_to_waiting_once_the_session_is_gone() {
         let mut link = DeepLink::leaving_for_test(
-            Link { server: None, rk: "7".into(), action: Action::Open }, 1_000 + LEAVE_WAIT_MS);
+            Link { server: None, rk: "7".into(), action: Action::Open, return_to: None }, 1_000 + LEAVE_WAIT_MS);
         let out = link.step(LinkEvent::Frame, &env(&KNOWN));
         assert!(fx_names(&out.fx).is_empty() && out.arm.is_none() && !out.leaves_playback);
         assert!(!link.is_leaving() && !link.is_idle());
@@ -737,7 +821,7 @@ mod tests {
         let bad = r#"{"parameters":{"plex":{}}}"#.to_owned();
         let rk_of = |e: LinkEvent| match e {
             LinkEvent::Arrived(Parsed::Link(link)) => link.rk,
-            LinkEvent::Arrived(Parsed::Bad) => "bad".into(),
+            LinkEvent::Arrived(Parsed::Bad(_)) => "bad".into(),
             LinkEvent::Arrived(Parsed::None) => "none".into(),
             LinkEvent::Frame => "frame".into(),
         };
@@ -747,6 +831,137 @@ mod tests {
         assert_eq!(rk_of(fold_arrivals(&[l("1"), bad.clone(), plain.clone()])), "1");
         assert_eq!(rk_of(fold_arrivals(&[l("1"), plain.clone(), l("2")])), "2");
         assert_eq!(rk_of(fold_arrivals(&[plain, bad])), "bad");
+    }
+
+    // `returnTo`: hand the screen back to the caller once the playback the link started has ended.
+
+    fn plex_payload(plex: &str) -> String { format!(r#"{{"parameters":{{"plex":{plex}}}}}"#) }
+
+    #[test]
+    fn reads_return_to_and_refuses_one_that_is_not_an_app_id() {
+        let with = |r: &str| Parsed::Link(Link {
+            server: None, rk: "5".into(), action: Action::Play, return_to: Some(r.to_owned()) });
+        assert_eq!(parse(&plex_payload(r#"{"ratingKey":"5","action":"play","returnTo":"com.tvweb.home"}"#)),
+            with("com.tvweb.home"));
+        assert_eq!(parse(&plex_payload(r#"{"ratingKey":"5","action":"play","returnTo":" my_app-2 "}"#)),
+            with("my_app-2"));
+        // Absent, null and blank are all "no return"; `open` keeps the field (the step ignores it).
+        for none in [r#""#, r#","returnTo":null"#, r#","returnTo":"  ""#] {
+            assert_eq!(parse(&plex_payload(&format!(r#"{{"ratingKey":"5","action":"play"{none}}}"#))),
+                link(None, "5", Action::Play), "{none}");
+        }
+        for bad in [
+            r#""a\"}, \"x\":\"y""#, r#""com.app/../x""#, r#""has space""#, r#"".starts.with.dot""#,
+            r#"12"#, r#"true"#, r#"{"id":"com.app"}"#,
+        ] {
+            let raw = plex_payload(&format!(r#"{{"ratingKey":"5","action":"play","returnTo":{bad}}}"#));
+            assert_eq!(parse(&raw), Parsed::Bad("bad returnTo"), "{bad}");
+        }
+        assert_eq!(parse(&plex_payload(&format!(r#"{{"ratingKey":"5","returnTo":"{}"}}"#, "a".repeat(129)))),
+            Parsed::Bad("bad returnTo"));
+    }
+
+    fn returning_link(action: Action) -> DeepLink {
+        DeepLink::waiting_for_test(
+            Link { server: None, rk: "7".into(), action, return_to: Some("com.tvweb.home".into()) }, None, false)
+    }
+
+    #[test]
+    fn link_step_a_play_link_with_return_to_arms_and_starts_watching() {
+        let mut link = returning_link(Action::Play);
+        let out = link.step(LinkEvent::Frame, &env(&KNOWN));
+        assert_eq!(fx_names(&out.fx),
+            ["request-detail:7", "log:deeplink: returns to com.tvweb.home when the playback ends"]);
+        assert!(matches!(out.arm, Some((_, ref rk, false)) if rk == "7"));
+        assert!(link.is_returning() && out.return_to.is_none());
+    }
+
+    #[test]
+    fn link_step_an_open_link_ignores_return_to() {
+        let mut link = returning_link(Action::Open);
+        let out = link.step(LinkEvent::Frame, &env(&KNOWN));
+        assert_eq!(fx_names(&out.fx), ["request-detail:7"]);
+        assert!(link.is_idle() && out.return_to.is_none());
+    }
+
+    #[test]
+    fn link_step_returns_once_after_the_playback_it_started_has_ended() {
+        let mut link = returning_link(Action::Play);
+        link.step(LinkEvent::Frame, &env(&KNOWN));
+        // Before the play starts, nothing; while it runs (Up Next included), nothing.
+        assert!(link.step(LinkEvent::Frame, &env(&KNOWN)).return_to.is_none() && link.is_returning());
+        for _ in 0..3 {
+            let out = link.step(LinkEvent::Frame, &standing(&KNOWN));
+            assert!(fx_names(&out.fx).is_empty() && out.return_to.is_none() && link.is_returning());
+        }
+        // The player is popping: wait for the stack to settle.
+        let mut e = env(&KNOWN);
+        e.nav_pending = true;
+        assert!(link.step(LinkEvent::Frame, &e).return_to.is_none() && link.is_returning());
+        // Settled on Home: hand the screen back, once.
+        let out = link.step(LinkEvent::Frame, &env(&KNOWN));
+        assert_eq!(fx_names(&out.fx), ["log:deeplink: playback ended, returning to com.tvweb.home"]);
+        assert_eq!(out.return_to.as_deref(), Some("com.tvweb.home"));
+        assert!(link.is_idle());
+        assert!(link.step(LinkEvent::Frame, &env(&KNOWN)).return_to.is_none());
+    }
+
+    #[test]
+    fn link_step_a_playback_that_ends_in_the_background_hands_nothing_over() {
+        let mut link = returning_link(Action::Play);
+        link.step(LinkEvent::Frame, &env(&KNOWN));
+        // A parked session still stands, backgrounded or not: not an ending.
+        let mut parked = standing(&KNOWN);
+        parked.foreground = false;
+        assert!(link.step(LinkEvent::Frame, &parked).return_to.is_none() && link.is_returning());
+        let mut gone = env(&KNOWN);
+        gone.foreground = false;
+        let out = link.step(LinkEvent::Frame, &gone);
+        assert_eq!(fx_names(&out.fx), ["log:deeplink: no return (another app has the screen)"]);
+        assert!(out.return_to.is_none() && link.is_idle());
+    }
+
+    #[test]
+    fn link_step_a_play_that_never_starts_gives_the_return_up_quietly() {
+        let mut link = returning_link(Action::Play);
+        link.step(LinkEvent::Frame, &env(&KNOWN));
+        let mut e = env(&KNOWN);
+        e.now = 1_000 + RETURN_START_WAIT_MS - 1;
+        assert!(fx_names(&link.step(LinkEvent::Frame, &e).fx).is_empty() && link.is_returning());
+        e.now = 1_000 + RETURN_START_WAIT_MS;
+        let out = link.step(LinkEvent::Frame, &e);
+        assert_eq!(fx_names(&out.fx), ["log:deeplink: no return (the playback never started)"]);
+        assert!(out.return_to.is_none() && link.is_idle());
+    }
+
+    #[test]
+    fn link_step_a_newer_link_replaces_a_return_that_is_still_watching() {
+        let mut link = returning_link(Action::Play);
+        link.step(LinkEvent::Frame, &env(&KNOWN));
+        link.step(LinkEvent::Frame, &standing(&KNOWN));
+        let mut e = standing(&KNOWN);
+        e.root = Root::Other;
+        let arrived = LinkEvent::Arrived(Parsed::Link(Link {
+            server: None, rk: "9".into(), action: Action::Open, return_to: None }));
+        link.step(arrived, &e);
+        assert!(!link.is_returning() && !link.is_idle());
+        // A link-less relaunch (a second tile press) does not end a return.
+        let mut link = returning_link(Action::Play);
+        link.step(LinkEvent::Frame, &env(&KNOWN));
+        link.step(LinkEvent::Arrived(Parsed::None), &standing(&KNOWN));
+        assert!(link.is_returning());
+    }
+
+    #[test]
+    fn perform_hands_a_return_to_the_platform() {
+        let _g = plx_base::testlock::serial();
+        let mut pages = plx_ui::dispatch::Dispatcher::<AppHost>::new();
+        let mut wait = None;
+        let before = plx_platform::tv::home::return_requests().len();
+        perform(LinkOut { return_to: Some("com.tvweb.home".into()), ..LinkOut::default() },
+            &mut pages, &mut wait, 0);
+        assert_eq!(plx_platform::tv::home::return_requests()[before..], ["com.tvweb.home".to_owned()]);
+        assert!(wait.is_none());
     }
 
     #[test]

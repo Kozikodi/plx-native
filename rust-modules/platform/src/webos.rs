@@ -362,12 +362,43 @@ pub fn poll_home() {
 /// minimize leg instead of leaving the user on a screen whose BACK did nothing.
 const HOME_APP_ID: &str = "com.webos.app.home";
 
-#[cfg(any(feature = "hostsim", test, feature = "test-support"))]
+/// The root press's SAM leg: launch the TV's Home, its lines under `gohome:`.
 fn launch_home() -> bool {
+    sam_launch(HOME_APP_ID, "gohome", "the root press")
+}
+
+#[cfg(any(feature = "hostsim", test, feature = "test-support"))]
+fn sam_launch(app_id: &str, tag: &str, why: &str) -> bool {
     plx_base::eventlog::log(&format!(
-        "gohome: no LS2 bus off-device — the root press would launch {HOME_APP_ID} on a television"
+        "{tag}: no LS2 bus off-device — {why} would launch {app_id} on a television"
     ));
     true
+}
+
+/// **Hand the screen to the app a launch link named** (`returnTo`, `docs/launch-links.md`), the
+/// launcher that asked for the playback that just ended.
+///
+/// The same SAM `launch` as [`go_home`]'s first leg, with the caller's id instead of LG's Home.
+/// If SAM refuses it (an id that is not installed comes back `returnValue: false`), it falls
+/// through to [`go_home`]'s own two legs — LG's Home, then minimizing — so the viewer is never
+/// left on a screen they were promised they would leave. Shares [`go_home`]'s in-flight latch, so a
+/// root press and a return cannot queue two bus calls behind each other.
+///
+/// The id is checked by the link's parser (`app::deeplink`), so it is a plain app id and goes into
+/// the payload as it is.
+pub fn return_to(app_id: &str) {
+    plx_base::eventlog::log(&format!("return: request app={app_id}"));
+    if HOME_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    let app = app_id.to_owned();
+    if !plx_base::task::spawn_small("platform return", move || {
+        if !sam_launch(&app, "return", "the end of a linked playback") && !launch_home() {
+            HOME_MINIMIZE.store(true, std::sync::atomic::Ordering::Release);
+        }
+        HOME_PENDING.store(false, std::sync::atomic::Ordering::Release);
+    }) {
+        HOME_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        minimize();
+    }
 }
 
 #[cfg(any(feature = "hostsim", test, feature = "test-support"))]
@@ -488,8 +519,8 @@ pub fn sound_output() -> crate::tv::sound::Reply {
 }
 
 #[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
-fn launch_home() -> bool {
-    let payload = format!("{{\"id\":\"{HOME_APP_ID}\"}}");
+fn sam_launch(app_id: &str, tag: &str, _why: &str) -> bool {
+    let payload = format!("{{\"id\":\"{app_id}\"}}");
     let started = std::time::Instant::now();
     let outcome = ls2::call_once("luna://com.webos.applicationManager/launch", &payload);
     let ms = started.elapsed().as_millis();
@@ -502,7 +533,7 @@ fn launch_home() -> bool {
             let ok =
                 reply.contains("\"returnValue\":true") || reply.contains("\"returnValue\": true");
             let verdict = if ok { "accepted" } else { "rejected" };
-            plx_base::eventlog::log(&format!("gohome: SAM {verdict} in {ms}ms → {reply}"));
+            plx_base::eventlog::log(&format!("{tag}: SAM {verdict} in {ms}ms → {reply}"));
             ok
         }
         // **Four different failures used to arrive as one sentence**, which is exactly the kind of
@@ -510,7 +541,7 @@ fn launch_home() -> bool {
         // refused this app a registration, the call was never submitted, or the reply really did
         // time out. They are three different bugs and only one of them is about SAM.
         Err(ls2::Fail::Setup { stage, detail, .. }) if detail.is_empty() => {
-            plx_base::eventlog::log(&format!("gohome: LS2 setup failed stage={stage} after {ms}ms"));
+            plx_base::eventlog::log(&format!("{tag}: LS2 setup failed stage={stage} after {ms}ms"));
             false
         }
         // The hub's own words, when it gave any. The register refusal that shipped with this
@@ -518,12 +549,12 @@ fn launch_home() -> bool {
         // which nobody reading the app's evidence knew to open.
         Err(ls2::Fail::Setup { stage, detail, .. }) => {
             plx_base::eventlog::log(&format!(
-                "gohome: LS2 setup failed stage={stage} after {ms}ms — {detail}"
+                "{tag}: LS2 setup failed stage={stage} after {ms}ms — {detail}"
             ));
             false
         }
         Err(ls2::Fail::Timeout) => {
-            plx_base::eventlog::log(&format!("gohome: SAM timed out in {ms}ms"));
+            plx_base::eventlog::log(&format!("{tag}: SAM timed out in {ms}ms"));
             false
         }
     }
