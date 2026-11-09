@@ -23,6 +23,7 @@ static PORT: plx_platform::tv::Port = plx_platform::tv::Port {
     system_locale: plx_platform::webos::system_locale,
     go_home: plx_platform::webos::go_home,
     poll_home: plx_platform::webos::poll_home,
+    return_to: plx_platform::webos::return_to,
     deliver_toast: plx_platform::webos::toast::deliver,
     bind_window: plx_platform::webos::bind_window,
     grab_surface: crate::system::sys_grab_wayland,

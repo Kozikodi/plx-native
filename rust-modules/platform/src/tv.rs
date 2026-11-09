@@ -25,6 +25,8 @@ pub struct Port {
     pub system_locale: fn() -> LocaleReply,
     pub go_home: fn(),
     pub poll_home: fn(),
+    /// Hand the screen to another app by its id: a launch link's `returnTo` (`tv::home::return_to`).
+    pub return_to: fn(&str),
     pub deliver_toast: fn(&str, toast::Identity) -> toast::Sent,
     pub bind_window: fn(*mut c_void),
     pub grab_surface: fn(*mut c_void),
@@ -60,6 +62,7 @@ static ABSENT: Port = Port {
     system_locale: || LocaleReply::NoPlatform,
     go_home: nothing,
     poll_home: nothing,
+    return_to: |_| {},
     deliver_toast: toast::deliver_without_port,
     bind_window: |_| {},
     grab_surface: |_| {},

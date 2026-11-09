@@ -16,6 +16,7 @@ luna://com.webos.applicationManager/launch
 | `ratingKey` | required | The item, as a string or a number; digits only. |
 | `server` | optional | The server's `machineIdentifier`. Without it, the signed-in current server. |
 | `action` | optional | `open` (the default) lands on the item's detail page; `play` starts it where Resume would. Anything else is `open`. |
+| `returnTo` | optional | With `play`: an app id to hand the screen back to once that playback ends. Usually the caller's own id. See [Returning to the caller](#returning-to-the-caller). |
 
 - Unknown keys are ignored. A launch with no `plex` object is an ordinary launch, unchanged.
 - The page opens with Home alone underneath it, so BACK returns to Home.
@@ -41,6 +42,34 @@ luna://com.webos.applicationManager/launch
   still letting go of the engine the play waits; if the engine is still busy when the wait's 12 s
   ceiling passes, the link is dropped with `deeplink: not opened, rk=… (engine busy)`.
 - The debug flavour's id is `com.beb.plxnative.debug`; the contract is the same.
+
+## Returning to the caller
+
+A launcher that starts a title wants its viewer back when the title is over, not left on
+PlxNative's Home. `returnTo` asks for that:
+
+```text
+{"id":"com.beb.plxnative","params":{"plex":{"ratingKey":"12345","action":"play","returnTo":"com.example.launcher"}}}
+```
+
+- Once the playback the link started has ended (BACK or STOP in the player, or the end of the last
+  item when Up Next does not continue), PlxNative launches `returnTo` through SAM
+  (`luna://com.webos.applicationManager/launch`, `return:` lines in the event log). The process
+  keeps running, as it does for BACK at Home.
+- Up Next's advance keeps the player up, so a run of episodes returns once, after the last.
+- Leaving with the TV's own Home key mid-film is not an ending: the session is parked, and
+  nothing is handed over.
+- If the session ends while another app has the screen, nothing is handed over
+  (`deeplink: no return (another app has the screen)`).
+- If the playback never starts (an unknown key, an engine that stays busy) within 30 s, the return
+  is given up with `deeplink: no return (the playback never started)` and PlxNative stays where it
+  is.
+- If SAM refuses the id (an app that is not installed), PlxNative goes to the TV's Home as BACK at
+  its own Home does.
+- `returnTo` is ignored with `action: open`. A value that is not a plain app id (letters, digits,
+  `.`, `-` and `_`, starting with a letter or digit, at most 128 bytes) makes the whole link
+  invalid, with `deeplink: not opened (bad returnTo)`. Absent, `null` or blank is no return.
+- A newer link replaces a return that is still waiting.
 
 ## A launch while the app runs
 
