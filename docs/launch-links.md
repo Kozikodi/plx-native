@@ -57,6 +57,9 @@ PlxNative's Home. `returnTo` asks for that:
   (`luna://com.webos.applicationManager/launch`, `return:` lines in the event log). The process
   keeps running, as it does for BACK at Home.
 - Up Next's advance keeps the player up, so a run of episodes returns once, after the last.
+- From then on the caller is also where BACK on PlxNative's own Home goes (instead of the TV's
+  Home), for as long as the process runs, so BACK pressed again after a return, or after a play
+  that never started, still leads back to it.
 - Leaving with the TV's own Home key mid-film is not an ending: the session is parked, and
   nothing is handed over.
 - If the session ends while another app has the screen, nothing is handed over

@@ -206,6 +206,9 @@ pub(crate) struct LinkOut {
     /// The linked playback has ended: hand the screen to this app (`returnTo`). A platform call with
     /// no effect value, so, like `arm`, it is the runner's to perform.
     pub(crate) return_to: Option<String>,
+    /// A `play` link named a `returnTo`: remember it as this process's Home, so BACK at the root
+    /// leads there too (`plx_platform::tv::home::set_caller`).
+    pub(crate) caller: Option<String>,
 }
 
 /// The link not yet handed to the menu-play wait. Owned by `App`; the state is private, so only
@@ -328,6 +331,7 @@ impl DeepLink {
         )));
         if let (Action::Play, Some(app)) = (link.action, link.return_to) {
             out.fx.push(log_line(format!("deeplink: returns to {app} when the playback ends")));
+            out.caller = Some(app.clone());
             self.0 = LinkState::Returning {
                 app, started: false, start_deadline: env.now.wrapping_add(RETURN_START_WAIT_MS) };
         }
@@ -488,6 +492,9 @@ pub(crate) fn perform(
     }
     if let Some((sid, rk, open)) = out.arm {
         *menu_play_await = Some(super::input::MenuPlayAwait::for_link(sid, rk, open, now));
+    }
+    if let Some(app) = out.caller {
+        plx_platform::tv::home::set_caller(&app);
     }
     if let Some(app) = out.return_to {
         plx_platform::tv::home::return_to(&app);
@@ -874,6 +881,7 @@ mod tests {
             ["request-detail:7", "log:deeplink: returns to com.tvweb.home when the playback ends"]);
         assert!(matches!(out.arm, Some((_, ref rk, false)) if rk == "7"));
         assert!(link.is_returning() && out.return_to.is_none());
+        assert_eq!(out.caller.as_deref(), Some("com.tvweb.home"));
     }
 
     #[test]
@@ -881,7 +889,7 @@ mod tests {
         let mut link = returning_link(Action::Open);
         let out = link.step(LinkEvent::Frame, &env(&KNOWN));
         assert_eq!(fx_names(&out.fx), ["request-detail:7"]);
-        assert!(link.is_idle() && out.return_to.is_none());
+        assert!(link.is_idle() && out.return_to.is_none() && out.caller.is_none());
     }
 
     #[test]
@@ -950,6 +958,16 @@ mod tests {
         link.step(LinkEvent::Frame, &env(&KNOWN));
         link.step(LinkEvent::Arrived(Parsed::None), &standing(&KNOWN));
         assert!(link.is_returning());
+    }
+
+    #[test]
+    fn perform_remembers_the_caller_as_home() {
+        let _g = plx_base::testlock::serial();
+        let mut pages = plx_ui::dispatch::Dispatcher::<AppHost>::new();
+        let mut wait = None;
+        perform(LinkOut { caller: Some("com.example.launcher".into()), ..LinkOut::default() },
+            &mut pages, &mut wait, 0);
+        assert_eq!(plx_platform::tv::home::caller().as_deref(), Some("com.example.launcher"));
     }
 
     #[test]

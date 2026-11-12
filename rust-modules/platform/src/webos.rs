@@ -355,8 +355,13 @@ pub fn poll_home() {
 /// minimize leg instead of leaving the user on a screen whose BACK did nothing.
 const HOME_APP_ID: &str = "com.webos.app.home";
 
-/// The root press's SAM leg: launch the TV's Home, its lines under `gohome:`.
+/// The root press's SAM leg: launch the TV's Home, its lines under `gohome:`. A launcher that
+/// started this process with a `returnTo` link is that viewer's Home, so it goes first
+/// (`tv::home::set_caller`); LG's Home is only the fallback, and on webOS 4 there is none to launch.
 fn launch_home() -> bool {
+    if let Some(caller) = crate::tv::home::caller() {
+        if sam_launch(&caller, "gohome", "the root press, to the launcher that started this") { return true; }
+    }
     sam_launch(HOME_APP_ID, "gohome", "the root press")
 }
 

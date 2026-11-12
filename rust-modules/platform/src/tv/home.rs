@@ -79,6 +79,21 @@ pub fn return_requests() -> Vec<String> {
     RETURN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+static CALLER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// **Remember the launcher that started this process with a `returnTo` link**, for the rest of
+/// the process: from then on BACK at the root goes to it rather than to LG's Home
+/// (`webos::go_home`), so every way out of a linked playback leads back to the caller, not only the
+/// end of the playback itself. The newest link's caller wins.
+pub fn set_caller(app_id: &str) {
+    *CALLER.lock().unwrap_or_else(|e| e.into_inner()) = Some(app_id.to_owned());
+}
+
+/// The launcher [`set_caller`] remembered, if any.
+pub fn caller() -> Option<String> {
+    CALLER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// **Hand the screen to the app a launch link named**, once the playback it asked for has ended
 /// (`docs/launch-links.md`, `returnTo`). Like [`go_home`] the process keeps running; unlike it there
 /// is no press to claim, since the request comes from the link once, not from a key.
