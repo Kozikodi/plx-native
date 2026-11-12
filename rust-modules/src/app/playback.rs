@@ -173,7 +173,7 @@ pub(crate) fn retry_failed_playback(
 
 /// How long a playing film may stand still, with nobody having paused or sought, before the stream
 /// is treated as dead and reopened. Long enough that a slow server's ordinary rebuffer is left alone.
-pub(crate) const STALL_MS: u32 = 20_000;
+pub(crate) const STALL_MS: u32 = 8_000;
 /// Reopens allowed at the same spot before the watch gives up there; the count is forgiven once
 /// the film has moved on [`STALL_FORGIVE_NS`] past the last one.
 pub(crate) const STALL_MAX_RECOVERIES: u8 = 3;
