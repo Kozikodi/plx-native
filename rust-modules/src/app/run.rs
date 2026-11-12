@@ -3214,6 +3214,32 @@ pub(crate) unsafe fn heartbeat(app: &mut App, fr: &mut Frame) {
                 }
             }
             app.play_prev = if playing { Some((pos_ns, fr.now)) } else { None };
+            // A film that has stopped by itself is reopened where it stopped (`playback::StallWatch`).
+            match app.stall.observe(
+                playing,
+                plx_media::player::lifecycle::paused(),
+                seek_pending() >= 0,
+                pos_ns,
+                fr.now,
+            ) {
+                super::playback::StallVerdict::Fine => {}
+                super::playback::StallVerdict::Reopen { at_s, attempt } => {
+                    log(&format!(
+                        "stall: playback stood still at {at_s}s for {} s — reopening the stream there (attempt {attempt})",
+                        super::playback::STALL_MS / 1000
+                    ));
+                    super::playback::retry_failed_playback(
+                        &mut app.player.session,
+                        &mut app.adapters.player,
+                        app.bridge.metadata_mut(),
+                        None,
+                        plx_media::player::report::AttemptOrigin::Recovery,
+                    );
+                }
+                super::playback::StallVerdict::GiveUp { at_s } => {
+                    log(&format!("stall: still stuck at {at_s}s after {} reopens — leaving it", super::playback::STALL_MAX_RECOVERIES));
+                }
+            }
             // `vtick=<n> vgap=<n>ms` — the media pipeline's own `FRAMEREADY` cadence, the only
             // field on this line that comes from the VIDEO plane's side of the house. Every
             // other number here describes the graphics plane: `fps=` counts our GL swaps and

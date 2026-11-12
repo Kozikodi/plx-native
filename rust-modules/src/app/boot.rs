@@ -2156,6 +2156,7 @@ pub(crate) unsafe fn construct(
         #[cfg(feature = "devtools")]
         fps_shown,
         play_prev,
+        stall: super::playback::StallWatch::default(),
         running,
         window_activity: super::window_activity::WindowActivity::new(),
         #[cfg(feature = "devtools")]

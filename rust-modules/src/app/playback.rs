@@ -171,6 +171,143 @@ pub(crate) fn retry_failed_playback(
     }
 }
 
+/// How long a playing film may stand still, with nobody having paused or sought, before the stream
+/// is treated as dead and reopened. Long enough that a slow server's ordinary rebuffer is left alone.
+pub(crate) const STALL_MS: u32 = 20_000;
+/// Reopens allowed at the same spot before the watch gives up there; the count is forgiven once
+/// the film has moved on [`STALL_FORGIVE_NS`] past the last one.
+pub(crate) const STALL_MAX_RECOVERIES: u8 = 3;
+pub(crate) const STALL_FORGIVE_NS: i64 = 60_000_000_000;
+/// Movement smaller than this does not count as the film moving.
+const STALL_MOVED_NS: i64 = 500_000_000;
+
+/// **A playback that stops by itself is reopened where it stopped.**
+///
+/// A stream whose source goes quiet without an error — a server's direct-stream remux that stalls,
+/// a connection that hangs without closing — leaves the player `Playing` at a position that no
+/// longer moves, and nothing else in the app notices: no read error, no EOS, no failure screen.
+/// The viewer's own fix was BACK and Play again. This does that for them: when the published
+/// position has not moved for [`STALL_MS`] while the transport is playing (not paused by the
+/// viewer, no seek in flight), the attempt is replaced with a fresh request at the same spot
+/// ([`retry_failed_playback`], origin `Recovery`). A pure observer — the caller performs the reopen.
+#[derive(Debug, Default)]
+pub(crate) struct StallWatch {
+    since_ns: i64,
+    since_ms: u32,
+    active: bool,
+    recoveries: u8,
+    last_recovery_ns: i64,
+    gave_up: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StallVerdict {
+    Fine,
+    Reopen { at_s: i64, attempt: u8 },
+    GiveUp { at_s: i64 },
+}
+
+impl StallWatch {
+    /// One observation, at the heartbeat. `playing` is the transport presenting frames,
+    /// `paused` the viewer's pause, `seeking` a seek in flight.
+    pub(crate) fn observe(&mut self, playing: bool, paused: bool, seeking: bool, pos_ns: i64, now_ms: u32) -> StallVerdict {
+        if !playing || paused || seeking || pos_ns <= 0 {
+            self.active = false;
+            return StallVerdict::Fine;
+        }
+        if !self.active || (pos_ns - self.since_ns).abs() >= STALL_MOVED_NS {
+            self.active = true;
+            self.since_ns = pos_ns;
+            self.since_ms = now_ms;
+            if self.recoveries > 0 && (pos_ns - self.last_recovery_ns).abs() >= STALL_FORGIVE_NS {
+                self.recoveries = 0;
+                self.gave_up = false;
+            }
+            return StallVerdict::Fine;
+        }
+        if now_ms.wrapping_sub(self.since_ms) < STALL_MS {
+            return StallVerdict::Fine;
+        }
+        // Stuck. Restart the clock either way, so a verdict is at most one per STALL_MS.
+        self.since_ms = now_ms;
+        let at_s = pos_ns / 1_000_000_000;
+        if self.recoveries >= STALL_MAX_RECOVERIES {
+            if self.gave_up { return StallVerdict::Fine; }
+            self.gave_up = true;
+            return StallVerdict::GiveUp { at_s };
+        }
+        self.recoveries += 1;
+        self.last_recovery_ns = pos_ns;
+        self.active = false;
+        StallVerdict::Reopen { at_s, attempt: self.recoveries }
+    }
+}
+
+#[cfg(test)]
+mod stall_watch_tests {
+    use super::{StallVerdict, StallWatch, STALL_MAX_RECOVERIES, STALL_MS};
+    const S: i64 = 1_000_000_000;
+
+    #[test]
+    fn a_moving_film_is_left_alone() {
+        let mut w = StallWatch::default();
+        for i in 0..200u32 {
+            assert_eq!(w.observe(true, false, false, 100 * S + i64::from(i) * S, i * 1000), StallVerdict::Fine);
+        }
+    }
+
+    #[test]
+    fn a_film_stuck_for_the_threshold_is_reopened_once_then_watched_again() {
+        let mut w = StallWatch::default();
+        let mut now = 0u32;
+        let mut seen = vec![];
+        for _ in 0..(STALL_MS / 1000 + 2) {
+            let v = w.observe(true, false, false, 1573 * S, now);
+            if v != StallVerdict::Fine { seen.push(v); }
+            now += 1000;
+        }
+        assert_eq!(seen, [StallVerdict::Reopen { at_s: 1573, attempt: 1 }]);
+    }
+
+    #[test]
+    fn a_pause_or_a_seek_is_not_a_stall() {
+        let mut w = StallWatch::default();
+        for i in 0..60u32 {
+            assert_eq!(w.observe(true, true, false, 50 * S, i * 1000), StallVerdict::Fine);
+            assert_eq!(w.observe(true, false, true, 50 * S, i * 1000 + 500), StallVerdict::Fine);
+        }
+        for i in 0..60u32 {
+            assert_eq!(w.observe(false, false, false, 50 * S, 100_000 + i * 1000), StallVerdict::Fine);
+        }
+    }
+
+    #[test]
+    fn repeated_stalls_at_one_spot_give_up_once_and_a_later_spot_is_forgiven() {
+        let mut w = StallWatch::default();
+        let mut now = 0u32;
+        let mut seen = vec![];
+        for _ in 0..(STALL_MS / 1000 * (u32::from(STALL_MAX_RECOVERIES) + 3)) {
+            let v = w.observe(true, false, false, 900 * S, now);
+            if v != StallVerdict::Fine { seen.push(v); }
+            now += 1000;
+        }
+        assert_eq!(seen.len(), usize::from(STALL_MAX_RECOVERIES) + 1);
+        assert_eq!(seen.last(), Some(&StallVerdict::GiveUp { at_s: 900 }));
+        // The film gets going again and moves well on: a new stall there is reopened again.
+        for i in 0..80i64 {
+            w.observe(true, false, false, 900 * S + i * S, now);
+            now += 1000;
+        }
+        let mut again = None;
+        for _ in 0..(STALL_MS / 1000 + 2) {
+            let v = w.observe(true, false, false, 1200 * S, now);
+            if v != StallVerdict::Fine { again = Some(v); break; }
+            now += 1000;
+        }
+        assert_eq!(again, Some(StallVerdict::Reopen { at_s: 1200, attempt: 1 }));
+    }
+}
+
 /// **The failure read-out's fix for Force Direct Play** — `FailureAction::PlayAutomatically`.
 ///
 /// A PERSISTENT switch, deliberately, not a one-shot: Force is what made this play fail, and it

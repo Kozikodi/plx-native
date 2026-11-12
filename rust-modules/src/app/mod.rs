@@ -235,6 +235,8 @@ pub(crate) struct App {
     #[cfg(feature = "devtools")]
     fps_shown: i32,
     play_prev: Option<(i64, u32)>,
+    /// Watches for a playback that stops moving on its own (`playback::StallWatch`).
+    stall: playback::StallWatch,
     running: bool,
     window_activity: window_activity::WindowActivity,
     #[cfg(feature = "devtools")]
